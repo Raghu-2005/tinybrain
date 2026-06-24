@@ -1,324 +1,379 @@
 # Tinybrain — Architecture & Design
 
-**Author:** Platform Engineering Candidate  
-**Date:** 2025  
-**Section:** 1 of 2 (Design Document)
-
----
-
-## 1.1 Architecture Diagram & Request Walkthrough
+## 1.1 Architecture Diagram
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     CONTROL PLANE  (SaaS · Databrain-managed)               │
-│                                                                             │
-│  ┌───────────────┐    ┌──────────────────┐    ┌──────────────────────────┐ │
-│  │  REST API      │    │  Agent Protocol  │    │  Postgres                │ │
-│  │               │    │  Layer           │    │                          │ │
-│  │ POST /tenants │    │ POST /enroll     │    │  tenants                 │ │
-│  │ POST /dash..  │    │ GET  /jobs/next  │    │  dashboards              │ │
-│  │ GET  /dash/:id│    │ POST /jobs/:id/  │    │  agents                  │ │
-│  │    /data      │    │      result      │    │  jobs                    │ │
-│  │               │    │ POST /heartbeat  │    │  results                 │ │
-│  └───────┬───────┘    └────────┬─────────┘    └──────────────────────────┘ │
-│          │                     │                          ▲                 │
-│          └─────────────────────┴──────────────────────────┘                 │
-│                                                                             │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │  Scheduler (background thread)                                       │  │
-│  │  Reads dashboards with refresh_interval, enqueues jobs in Postgres   │  │
-│  └──────────────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────────┘
-                      ▲                           ▲
-                      │  HTTPS (outbound only)    │  HTTPS (outbound only)
-                      │  from data plane →        │  from data plane →
-                      │                           │
-┌─────────────────────┴──────────┐   ┌────────────┴───────────────────────────┐
-│  DATA PLANE — Tenant A         │   │  DATA PLANE — Tenant B                 │
-│  (customer-hosted)             │   │  (customer-hosted)                     │
-│                                │   │                                        │
-│  ┌──────────────────────────┐  │   │  ┌──────────────────────────┐          │
-│  │  tinybrain-agent         │  │   │  │  tinybrain-agent         │          │
-│  │  - enrolls once          │  │   │  │  - enrolls once          │          │
-│  │  - heartbeats every 30s  │  │   │  │  - heartbeats every 30s  │          │
-│  │  - long-polls for jobs   │  │   │  │  - long-polls for jobs   │          │
-│  │  - executes SQL locally  │  │   │  │  - executes SQL locally  │          │
-│  │  - posts results back    │  │   │  │  - posts results back    │          │
-│  └─────────────┬────────────┘  │   │  └─────────────┬────────────┘          │
-│                │                │   │                │                       │
-│  ┌─────────────▼────────────┐  │   │  ┌─────────────▼────────────┐          │
-│  │  DuckDB (Tenant A data)  │  │   │  │  DuckDB (Tenant B data)  │          │
-│  │  Warehouse credentials   │  │   │  │  Warehouse credentials   │          │
-│  │  never leave this box    │  │   │  │  never leave this box    │          │
-│  └──────────────────────────┘  │   │  └──────────────────────────┘          │
-└────────────────────────────────┘   └────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    CONTROL PLANE  (SaaS · Databrain-managed)            │
+│                                                                         │
+│  ┌─────────────────┐   ┌──────────────────┐   ┌──────────────────────┐ │
+│  │   REST API       │   │  Agent Protocol  │   │     PostgreSQL       │ │
+│  │                 │   │                  │   │                      │ │
+│  │ POST /tenants   │   │ POST /enroll     │   │  tenants             │ │
+│  │ POST /dashboards│   │ POST /heartbeat  │   │  agents              │ │
+│  │ GET  /dash/:id  │   │ GET  /jobs/next  │   │  dashboards          │ │
+│  │      /data      │   │ POST /jobs/:id/  │   │  jobs                │ │
+│  │                 │   │       result     │   │  results             │ │
+│  └────────┬────────┘   └────────┬─────────┘   └──────────────────────┘ │
+│           │                     │                        ▲              │
+│           └─────────────────────┴────────────────────────┘              │
+│                                                                         │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │  Scheduler (asyncio background task — runs every 5 seconds)      │   │
+│  │  · Finds dashboards where next_run_at <= now()                   │   │
+│  │  · Inserts pending job rows into jobs table                      │   │
+│  │  · Resets stale running jobs back to pending (crash recovery)    │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────┘
+                ▲                                    ▲
+                │  outbound HTTPS only               │  outbound HTTPS only
+                │  (agent initiates)                 │  (agent initiates)
+                │                                    │
+┌───────────────┴──────────────┐    ┌────────────────┴─────────────────────┐
+│  DATA PLANE — Tenant A       │    │  DATA PLANE — Tenant B               │
+│  (customer-hosted)           │    │  (customer-hosted)                   │
+│                              │    │                                      │
+│  ┌────────────────────────┐  │    │  ┌────────────────────────┐          │
+│  │  tinybrain-agent       │  │    │  │  tinybrain-agent       │          │
+│  │                        │  │    │  │                        │          │
+│  │  1. enroll() once      │  │    │  │  1. enroll() once      │          │
+│  │  2. heartbeat thread   │  │    │  │  2. heartbeat thread   │          │
+│  │  3. poll_loop forever  │  │    │  │  3. poll_loop forever  │          │
+│  │  4. execute_query()    │  │    │  │  4. execute_query()    │          │
+│  │  5. post_result()      │  │    │  │  5. post_result()      │          │
+│  └──────────┬─────────────┘  │    │  └──────────┬─────────────┘          │
+│             │                │    │             │                         │
+│  ┌──────────▼─────────────┐  │    │  ┌──────────▼─────────────┐          │
+│  │  DuckDB (Tenant A)     │  │    │  │  DuckDB (Tenant B)     │          │
+│  │  sales table           │  │    │  │  subscriptions table   │          │
+│  │  /data/warehouse.db    │  │    │  │  /data/warehouse.db    │          │
+│  │                        │  │    │  │                        │          │
+│  │  Credentials stay here │  │    │  │  Credentials stay here │          │
+│  │  — never transmitted   │  │    │  │  — never transmitted   │          │
+│  └────────────────────────┘  │    │  └────────────────────────┘          │
+└──────────────────────────────┘    └──────────────────────────────────────┘
 
 Browser / embed caller
-  └─→ GET /v1/dashboards/:id/data  →  Control plane  →  returns latest result
-       (session owned by control plane; result was pre-computed by agent)
+  └─→ GET /v1/dashboards/:id/data  →  Control plane reads results table
+       No warehouse query on this path. Result was pre-computed by the agent.
 ```
 
-### End-to-end request walkthrough
+### End-to-end Walkthrough
 
-A user loads an embedded dashboard in their browser. Here is the precise sequence of events:
+A user loads an embedded dashboard. Here is the exact sequence:
 
-1. **Browser → Control plane.** The browser (or host SaaS app) calls `GET /v1/dashboards/:id/data`. The control plane owns the session and validates the caller's API key. The warehouse and its credentials are never involved in this step.
+**Embedding path (user-facing, fast):**
 
-2. **Control plane reads from Postgres.** The control plane queries the `results` table for the most recent successful result for this `dashboard_id`. SQL was composed in an earlier background cycle (see step 4 below) — not on this request path. The control plane returns the stored result immediately as JSON.
+1. Browser calls `GET /v1/dashboards/:id/data` on the control plane.
+2. Control plane validates the request, queries the `results` table in PostgreSQL for the most recent result for that `dashboard_id`.
+3. Returns the stored JSON result immediately. No agent involved. No warehouse query. Latency is network + one Postgres read.
 
-3. **Pixels appear.** The browser renders the result. Latency is purely network + Postgres read. No warehouse query happens during embedding.
+**Background path (scheduled, async):**
 
-**How the result got there (background path):**
+4. The scheduler wakes up every 5 seconds. It queries `dashboards WHERE next_run_at <= now()`, atomically advances `next_run_at` by `refresh_interval`, and inserts a new row into the `jobs` table with `status = pending`.
+5. The agent is running inside the customer's network, making an outbound long-poll request: `GET /v1/agent/jobs/next?timeout=25`.
+6. The control plane resolves the agent's bearer token → `agent_id` → `tenant_id`. The job query is `WHERE tenant_id = $agent_tenant_id AND status = 'pending' FOR UPDATE SKIP LOCKED`. The agent can only ever see jobs belonging to its own tenant.
+7. The control plane claims the job (sets `status = running`, `claimed_by = agent_id`) and returns it to the agent.
+8. The agent runs the SQL against local DuckDB. Warehouse credentials never leave the agent process.
+9. The agent calls `POST /v1/agent/jobs/:id/result` with the result rows. The control plane writes to the `results` table (upsert by `dashboard_id`) and sets job `status = done`.
+10. The next call to the embedding endpoint returns the fresh result.
 
-4. **Scheduler enqueues a job.** A background thread on the control plane reads all dashboards whose `next_run_at <= now()`. For each, it inserts a row into the `jobs` table with `status = pending` and the dashboard's compiled SQL.
-
-5. **Agent polls.** The agent is running inside the customer's network, making outbound HTTPS requests to `GET /v1/agent/jobs/next`. The control plane holds the connection open up to 30 seconds (long-poll). When a job exists for this agent's tenant, it returns immediately.
-
-6. **Tenant isolation enforced.** The control plane resolves the agent's bearer token → `agent_id` → `tenant_id`. The job query is `WHERE tenant_id = $agent_tenant_id AND status = 'pending'`. An agent can never receive a job belonging to another tenant.
-
-7. **Agent executes SQL locally.** The agent runs the job's SQL against its local DuckDB instance. Warehouse credentials never leave the customer's network. The control plane never sees raw data — only the result set.
-
-8. **Agent posts result.** `POST /v1/agent/jobs/:id/result` sends the JSON result back. The control plane writes it to the `results` table keyed by `dashboard_id`. The embedding endpoint now serves this result.
-
-**Component ownership summary:**
-- Session: control plane
-- Warehouse credentials: data plane only
-- SQL composition: control plane (stored with the dashboard definition)
-- SQL execution: data plane (inside the agent, against DuckDB)
-- Result between execution and rendering: Postgres on the control plane (`results` table)
+**Component ownership:**
+- Session ownership: control plane
+- Warehouse credentials: data plane only, never transmitted
+- SQL authoring: control plane (stored with the dashboard definition)
+- SQL execution: data plane (agent, against local DuckDB)
+- Result storage between execution and rendering: PostgreSQL `results` table on the control plane
 
 ---
 
 ## 1.2 The Boundary
 
-### Ownership table
+### Ownership Table
 
-| Concern | Owner | Why |
+| Concern | Owner | Reason |
 |---|---|---|
-| Dashboard definitions (name, SQL, refresh interval) | **Control** | Databrain-authored config, no customer data involved. Central source of truth. |
-| Warehouse connection credentials | **Data** | Must never leave the customer's network. The control plane is stateless about these. |
-| Compiled SQL for a given dashboard | **Control** | SQL is authored by Databrain / the tenant admin and stored with the dashboard definition. The agent receives it as part of the job payload. |
-| Raw query results | **Data** (transiently) | The agent holds raw results for the duration of the POST. Once delivered, they live in the control plane's results store — but only as the most recent snapshot, not a full history. |
-| Cached / aggregated query results | **Control** | The control plane stores the latest result per dashboard in Postgres. This is the embedding endpoint's source of truth. |
-| User accounts and SSO | **Control** | Identity belongs to the SaaS layer. The data plane has no concept of end-users. |
-| Audit log of who viewed which dashboard | **Control** | Access events are generated when the embedding endpoint is called — no data plane involvement. |
-| Audit log of which SQL ran against the warehouse | **Both** | The control plane records what SQL was dispatched (job log). The data plane records what actually executed. Both logs are required for a complete audit trail. |
-| Per-dashboard query latency metrics | **Both** | The agent measures execution time and reports it in the job result. The control plane stores and aggregates it. |
-| Per-dashboard query error messages | **Both** | The agent captures the error and posts it back. The control plane stores it so the embedding endpoint can surface it. Error messages must be scrubbed of credential or schema details before leaving the data plane. |
-| Agent version and uptime | **Control** | Reported via heartbeat. The control plane tracks this for observability and upgrade targeting. |
+| Dashboard definitions (name, SQL, refresh interval) | Control | Databrain-authored config. No customer data. Central source of truth. |
+| Warehouse connection credentials | Data | Never leave the customer's network. Control plane has no knowledge of them. |
+| Compiled SQL for a given dashboard | Control | SQL is authored and stored with the dashboard. Sent to the agent as part of the job payload. |
+| Raw query results | Data (transiently) | The agent holds raw results briefly during execution. After posting, they live on the control plane as the latest result snapshot only. |
+| Cached / aggregated query results | Control | Stored in the `results` table keyed by `dashboard_id`. The embedding endpoint reads this. |
+| User accounts and SSO | Control | Identity belongs to the SaaS layer. The data plane has no concept of end-users. |
+| Audit log of who viewed which dashboard | Control | Access events are generated when the embedding endpoint is called. No agent involvement. |
+| Audit log of which SQL ran against the warehouse | Both | Control plane records what SQL was dispatched (job row). Agent records what actually executed (agent logs). Both are needed for a complete audit trail. |
+| Per-dashboard query latency metrics | Both | Agent measures and reports `execution_ms` in the result payload. Control plane stores and exposes it. |
+| Per-dashboard query error messages | Both | Agent captures the error and posts it back. Control plane stores and surfaces it on the embedding endpoint. |
+| Agent version and uptime | Control | Reported via heartbeat. Stored as `last_seen_at` and `agent_version` on the `agents` table. |
 
-### What the control plane is forbidden from knowing or doing
+### What the Control Plane is Forbidden From Knowing or Doing
 
-These are hard security invariants. If we ever detect the control plane doing any of these in production, it is treated as a security incident requiring immediate incident response:
+These are hard security invariants. Violation of any of these in production is treated as a security incident:
 
-- **Storing warehouse credentials.** The control plane must never receive, store, or log connection strings, passwords, API keys, or any credential used to access a customer's data warehouse. Enrollment flow must not ask for them.
-- **Opening a connection toward the data plane.** The control plane has no IP address, hostname, or port for any agent. All connectivity is initiated by the agent. Violating this breaks the firewall model and exposes customers to inbound network risk.
-- **Executing SQL against customer data.** The control plane composes SQL but never runs it. Execution is the data plane's exclusive responsibility.
-- **Accessing one tenant's data on behalf of another.** Every database query on the control plane that touches jobs, results, dashboards, or agents must be scoped by `tenant_id`. A cross-tenant data leak from the control plane is a P0 security incident regardless of cause.
-- **Retaining raw row-level data from customer warehouses beyond the single latest result per dashboard.** The control plane is a result cache, not a data lake. Storing query history or multiple result versions creates a data residency liability that customers did not consent to.
+- **It must never store, receive, or log warehouse credentials** of any kind — connection strings, passwords, API keys. The enrollment flow does not ask for them. They are not part of any request schema.
+- **It must never open a connection toward the data plane.** The control plane holds no IP address, hostname, or port for any agent. All network connectivity is initiated by the agent. This is enforced architecturally — there is no outbound connection code in the control plane.
+- **It must never execute SQL against customer data.** The control plane composes SQL and stores it. Execution is exclusively the agent's responsibility.
+- **It must never return one tenant's data to another tenant's request.** Every database query touching jobs, results, dashboards, or agents is scoped by `tenant_id`. A cross-tenant data leak is a P0 security incident regardless of cause.
+- **It must never retain a history of raw row-level warehouse data.** The `results` table stores one result per dashboard — the most recent. There is no historical result log. The control plane is a result cache, not a data warehouse.
 
 ---
 
-## 1.3 Protocol Sketch
+## 1.3 Protocol
 
-All communication is HTTPS. Authentication uses `Authorization: Bearer <token>` on every agent-facing request. The control plane never opens a connection to the agent.
+All communication is HTTPS. Agent authentication uses `Authorization: Bearer <token>` on every request after enrollment. The control plane never initiates connections to the agent.
 
-### Enrollment — proving identity the first time
+### Enrollment — one-time token exchange
 
-Enrollment converts a one-time token (issued at tenant creation) into a long-lived agent bearer token.
-
-**Precondition:** A tenant has been created via `POST /v1/tenants`, which returns a single-use `enrollment_token`.
+**Precondition:** A tenant has been created via `POST /v1/tenants`, which returns a single-use `enrollment_token` (UUID4).
 
 ```
 POST /v1/agent/enroll
 Authorization: Bearer <enrollment_token>
+Content-Type: application/json
 
-Request body:
 {
   "agent_version": "0.1.0",
-  "hostname":      "prod-agent-acme-1"   // informational only
+  "hostname":      "prod-agent-acme-1"
 }
 
-Response 200:
+Response 201:
 {
-  "agent_id":    "agt_a1b2c3d4",
-  "agent_token": "tk_live_xxxxxxxxxxxx",  // long-lived; store securely
-  "tenant_id":   "tnt_xyz789"
+  "agent_id":    "agt_a1b2c3d4...",
+  "agent_token": "a3f9e2...64-char hex...",
+  "tenant_id":   "tnt_xyz789..."
 }
 
-Response 401: enrollment_token already used or expired
-Response 404: enrollment_token not found
+Response 401: token already used or not found
 ```
 
-**Implementation notes:**
-- `enrollment_token` is a UUID stored in the `tenants` table with `enrolled_at = NULL`. On use, set `enrolled_at = now()`. Subsequent calls with the same token return 401.
-- `agent_token` is a randomly generated 32-byte hex string stored (hashed with SHA-256) in the `agents` table. The plaintext is returned once and never stored.
-- One enrollment token → one agent. To replace a compromised agent, an admin creates a new enrollment token for the tenant.
+**Implementation:**
+- `enrollment_token` is stored in plaintext on the `tenants` table. On use, `enrolled_at` is set and the token cannot be reused (`enrolled_at IS NULL` check in the query).
+- `agent_token` is 32 bytes from `secrets.token_hex()` — 256 bits of entropy. Only the SHA-256 hash is stored in the `agents` table. The plaintext is returned once and never stored anywhere.
+- The enrollment and agent creation are wrapped in a single database transaction — atomic. If either fails, neither happens.
 
----
+### Ongoing Authentication
 
-### Ongoing auth — every subsequent request
-
-Every request after enrollment uses `Authorization: Bearer <agent_token>`. The control plane:
-1. Looks up the SHA-256 hash of the provided token in the `agents` table.
+Every request after enrollment sends `Authorization: Bearer <agent_token>`. On each request the control plane:
+1. Computes `SHA-256(incoming_token)` and looks it up in `agents.token_hash`.
 2. Checks `revoked_at IS NULL`.
-3. Resolves `tenant_id` from the agent record. All subsequent DB queries are scoped to this `tenant_id`.
+3. Derives `tenant_id` from the agent record. All subsequent queries are scoped to this `tenant_id`.
 
-**Revoking a compromised agent:**
+### Agent Revocation
 
 ```
 POST /v1/admin/agents/:agent_id/revoke
-Authorization: Bearer <admin_api_key>
+X-Admin-Key: <admin_api_key>
 
-Response 200: { "revoked_at": "2025-06-10T14:22:00Z" }
+Response 200:
+{
+  "agent_id":   "agt_...",
+  "revoked_at": "2025-06-10T14:22:00Z"
+}
 ```
 
-Once revoked, all subsequent requests from that agent return `401 Unauthorized`. The agent's poll loop must handle 401 by stopping (not retrying with exponential backoff, which would only spam the endpoint).
+After revocation, every request from that agent returns `401`. The agent process detects `401` on heartbeat or job poll and calls `os._exit(1)` — it stops immediately without retry.
 
----
-
-### Job dispatch — outbound-only, long-poll
-
-The agent discovers work by polling. The control plane never pushes.
+### Job Dispatch — Long-Poll
 
 ```
-GET /v1/agent/jobs/next
+GET /v1/agent/jobs/next?timeout=25
 Authorization: Bearer <agent_token>
-
-Query params:
-  ?timeout=25   // seconds to hold connection (server-side long-poll)
 
 Response 200 (job available):
 {
-  "job_id":       "job_cc3f1a22",
-  "dashboard_id": "dsh_9f2e3b",
+  "job_id":       "job_cc3f1a22...",
+  "dashboard_id": "dsh_9f2e3b...",
   "sql":          "SELECT region, SUM(revenue) FROM sales GROUP BY region",
-  "timeout_ms":   30000    // agent must abandon execution after this
+  "timeout_ms":   30000
 }
 
-Response 204: no jobs pending within timeout window (agent should poll again immediately)
-Response 401: token revoked or invalid — agent must stop
-Response 429: agent is polling too fast — back off for retry_after seconds
+Response 204: no job arrived within the timeout window
+Response 401: token revoked — agent must stop
+Response 429: polling too fast — back off
 ```
 
-**Implementation notes:**
-- The control plane holds the HTTP connection open for up to `timeout` seconds using a polling loop against the `jobs` table (`SELECT ... WHERE tenant_id = $1 AND status = 'pending' LIMIT 1 FOR UPDATE SKIP LOCKED`). `FOR UPDATE SKIP LOCKED` prevents two agents (if a tenant ever runs multiple) from claiming the same job.
-- On claiming a job, set `status = 'running'`, `claimed_by = agent_id`, `claimed_at = now()`.
-- The scheduler also runs a stale-job reaper: any job in `status = 'running'` for more than `timeout_ms + 10s` is reset to `pending` for retry.
+**Implementation:** The server holds the HTTP connection open for up to 25 seconds, checking the `jobs` table every 1 second using `asyncio.sleep()` (non-blocking). Job claim uses `SELECT ... FOR UPDATE SKIP LOCKED` — the Postgres-native job queue pattern. This prevents two agents from claiming the same job without application-level locking and without deadlocks.
 
----
-
-### Result delivery — posting back a completed job
+### Result Delivery
 
 ```
 POST /v1/agent/jobs/:job_id/result
 Authorization: Bearer <agent_token>
+Content-Type: application/json
 
-Request body (success):
+Success:
 {
-  "status":        "success",
-  "rows":          [ {"region": "North", "revenue": 142000}, ... ],
-  "row_count":     12,
-  "execution_ms":  340,
-  "truncated":     false
+  "status":       "success",
+  "rows":         [ {"region": "North", "revenue": 142000}, ... ],
+  "row_count":    12,
+  "execution_ms": 340,
+  "truncated":    false
 }
 
-Request body (failure):
+Error:
 {
   "status":        "error",
-  "error_code":    "QUERY_TIMEOUT",
-  "error_message": "Query exceeded 30000ms limit",
+  "error_code":    "EXECUTION_ERROR",
+  "error_message": "...",
   "execution_ms":  30001
 }
 
 Response 200: { "accepted": true }
-Response 400: job_id does not belong to this agent's tenant
 Response 409: result already submitted for this job_id (idempotency guard)
+Response 403: job does not belong to this agent's tenant
 ```
 
-**Size limit:** Result body must not exceed 1 MB. If the agent detects the serialised result exceeds this threshold before posting, it truncates rows and sets `"truncated": true`. The control plane enforces this limit at the HTTP layer (`Content-Length` check) and returns `413` if exceeded.
+**Size limit:** 1 MB. If the serialised result exceeds this, the agent truncates rows and sets `truncated: true` before posting.
 
-**Idempotency:** The control plane stores `job_id` on the `results` row. A duplicate POST for the same `job_id` returns 409. This guards against agent retries on network failure.
+**Idempotency:** The control plane rejects duplicate submissions for the same `job_id` with `409`. This handles the case where the agent posts successfully but loses the network before receiving the `200` and retries.
 
----
-
-### Heartbeat / liveness
+### Heartbeat
 
 ```
 POST /v1/agent/heartbeat
 Authorization: Bearer <agent_token>
 
-Request body:
-{
-  "agent_version": "0.1.0",
-  "status":        "idle",   // or "running" if executing a job
-  "job_id":        null      // or current job_id if running
-}
+{ "agent_version": "0.1.0", "status": "idle" }
 
 Response 200: { "ok": true }
-Response 401: revoked — agent must stop
+Response 401: revoked — agent must stop immediately
 ```
 
-The agent sends a heartbeat every 30 seconds. The control plane updates `agents.last_seen_at`. Any agent with `last_seen_at < now() - 90s` is considered offline. The control plane does not act on this automatically — it is surfaced as an observability signal only.
+The agent sends a heartbeat every 30 seconds. The control plane updates `agents.last_seen_at`. Agents with `last_seen_at > 90 seconds ago` are considered offline — this is surfaced as an observability signal but does not trigger automated action in this implementation.
 
 ---
 
 ## 1.4 Migration from Self-Hosted — Acme Corp
 
-**Acme's situation:** `tinybrain-monolith v0.9.0`, fully self-hosted in their AWS account. 40 dashboards, 200 internal users, 12 external customers consuming embedded analytics. The embedded analytics are revenue-generating — any visible outage affects Acme's customers, not just their internal team. This is the most important risk to manage.
+**Acme's situation:** `tinybrain-monolith v0.9.0`, fully self-hosted in their AWS account. 40 dashboards, 200 internal users, 12 external customers consuming embedded analytics via their app. The external customer dashboards are revenue-generating — any visible outage to Acme's end-users is unacceptable.
 
----
+### Phase 0 — Discovery
 
-### Phase 0 — Discovery (before touching anything)
+Do not touch anything until we know the following:
 
-We do not assume we understand Acme's setup. We verify it.
+- Which of the 40 dashboards are internal-only and which are embedded in Acme's customer-facing product? External-facing ones are last to migrate, not first.
+- Current p95 query latency per dashboard. These become acceptance criteria — if the new stack is slower, we do not cut over.
+- Warehouse topology: is the warehouse in the same VPC as the monolith? The agent needs outbound HTTPS to Databrain's control plane endpoint — confirm no egress proxy or firewall rule blocks this.
+- Acme's SSO/auth setup for the 200 internal users. Do accounts need to be migrated or will users re-register?
+- Agree on a maintenance window for the final cutover. External dashboards get a window during Acme's lowest-traffic period — checked against their own analytics.
 
-- Inventory all 40 dashboards: which are used by internal users vs. the 12 external customers? Which have SLAs attached? External-facing dashboards are the last to migrate, not the first.
-- Identify the warehouse type and connection topology. Is the warehouse in the same AWS VPC as the monolith? The agent will need outbound HTTPS to our control plane — confirm no egress restrictions block this.
-- Capture current refresh intervals and p95 query latency per dashboard. These become our acceptance criteria for the migration — if the new stack is slower, we don't cut over.
-- Identify Acme's auth mechanism. Are the 200 internal users on SSO? We need to know if user accounts need to be migrated or if they'll be re-invited.
-- Agree on a maintenance window for Phase 2 cutover. External-customer-facing dashboards get a window during their lowest-traffic period (check Acme's analytics).
+### Phase 1 — Coexistence
 
----
+Goal: the new architecture runs in parallel while the monolith continues serving all traffic.
 
-### Phase 1 — Coexistence (old and new run side by side)
+1. Deploy `tinybrain-agent` inside Acme's AWS VPC. It makes outbound HTTPS connections to Databrain's control plane. No inbound firewall rules required. Acme's security team reviews the agent binary and network egress policy.
+2. Migrate 5 internal-only, low-traffic dashboards first. Re-create them in the control plane. Run both stacks simultaneously — compare results from new vs. old for 48 hours.
+3. If results match and latency is within SLA, migrate the remaining internal dashboards in batches of 10.
+4. Do not touch the 12 external-customer dashboards during Phase 1. They stay 100% on the monolith.
 
-Goal: the new architecture serves non-critical dashboards while the monolith continues to serve everything else.
+Rollback at any point in Phase 1 is zero-risk — the monolith is untouched, embed URLs have not changed.
 
-1. **Deploy the agent** inside Acme's AWS VPC. It connects outbound to the Databrain control plane. No inbound firewall rules required. Acme's security team reviews the agent binary and network policy before deployment.
-2. **Migrate internal-only dashboards first.** Pick 5 low-traffic internal dashboards. Re-create them in the control plane, let the agent start serving them. Acme's team compares results against the monolith for 48 hours. If results match and latency is acceptable, proceed.
-3. **Migrate remaining internal dashboards in batches of 10.** Each batch runs in shadow mode: the new stack produces results, but the monolith is still the source of truth for users. Acme's team spot-checks. Shadow mode is easy to implement — just don't update the embed URL yet.
-4. **Do not touch external-customer-facing dashboards during Phase 1.** They remain 100% on the monolith.
+### Phase 2 — Cutover
 
-Rollback at any point in Phase 1: the monolith is untouched. Flip the embed URL back. Zero impact.
-
----
-
-### Phase 2 — Cutover and rollback
-
-1. **Pre-cutover checklist:** All 40 dashboards defined in the control plane. Agent healthy and producing matching results. Rollback plan reviewed with Acme's on-call team. Maintenance window confirmed with Acme's external customers (brief "scheduled maintenance" banner).
-2. **Cutover sequence (during window):**
-   - Pause the monolith's dashboard refresh jobs (stop new queries being fired at the warehouse from the old system).
-   - Update embed URLs / API keys to point to the control plane's `GET /v1/dashboards/:id/data` endpoint.
+1. Pre-cutover checklist: all 40 dashboards defined in the control plane, agent healthy, results matching, rollback plan reviewed, maintenance window confirmed with Acme.
+2. Cutover sequence:
+   - Pause the monolith's scheduler (stop it firing new warehouse queries).
+   - Update embed URLs and API keys to point to `GET /v1/dashboards/:id/data`.
    - Verify the first 3 external-customer dashboards load correctly.
-   - Roll out to all external-customer dashboards.
-   - Total window target: 30 minutes.
-3. **Rollback trigger:** If any external-customer dashboard fails to load correct data within the first 5 minutes of cutover, revert embed URLs to the monolith immediately. The monolith is still running and has not been touched — rollback is a URL swap, not a data restoration.
-4. **Post-cutover monitoring (24 hours):** Watch query latency, error rates, and heartbeat health in the control plane. Acme's support channel is on standby.
-
----
+   - Roll out to all remaining dashboards.
+   - Target window: 30 minutes.
+3. Rollback trigger: if any external-customer dashboard returns incorrect data within the first 5 minutes, revert embed URLs to the monolith immediately. The monolith has not been decommissioned — rollback is a URL swap, not a data restore.
 
 ### Phase 3 — Decommission
 
-Only after 2 weeks of stable operation on the new stack with no rollback events:
+Only after 14 days of stable operation with no rollback events:
 
-1. Export Acme's dashboard definitions and results from the monolith as a final snapshot (archival only).
-2. Shut down the monolith service. Do not delete it yet.
-3. After 30 days with no incidents, terminate the monolith EC2 instances and revoke its IAM roles.
-4. Communicate closure to Acme: confirm the migration is complete, share the new observability dashboard showing agent health and query latency.
-
-**The principle throughout:** we treat Acme's external customers as our own. Any step that risks them is the last step, not the first.
+1. Export a final snapshot of the monolith's dashboard definitions and result history for archival.
+2. Stop the monolith service. Do not delete infrastructure yet.
+3. After 30 further days with no incidents: terminate EC2 instances, revoke IAM roles, delete the old deployment.
+4. Confirm closure to Acme with a summary of the migration and a link to the new agent health dashboard.
 
 ---
 
-*This document is the source of truth for the system built in Section 2. If the implementation diverges from this design, this document is updated to reflect what was actually built, with a note explaining why.*
+## Database Schema
+
+Five tables, created automatically at control plane startup via `CREATE TABLE IF NOT EXISTS`:
+
+```sql
+tenants (
+  id               TEXT PRIMARY KEY,   -- "tnt_<uuid4_hex>"
+  name             TEXT NOT NULL,
+  enrollment_token TEXT NOT NULL UNIQUE, -- plaintext UUID, single-use
+  enrolled_at      TIMESTAMPTZ,          -- NULL until agent enrolls
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+
+agents (
+  id            TEXT PRIMARY KEY,       -- "agt_<uuid4_hex>"
+  tenant_id     TEXT REFERENCES tenants(id),
+  token_hash    TEXT NOT NULL UNIQUE,   -- SHA-256(plaintext_token)
+  hostname      TEXT,
+  agent_version TEXT,
+  last_seen_at  TIMESTAMPTZ,
+  revoked_at    TIMESTAMPTZ,            -- NULL = active
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+
+dashboards (
+  id               TEXT PRIMARY KEY,   -- "dsh_<uuid4_hex>"
+  tenant_id        TEXT REFERENCES tenants(id),
+  name             TEXT NOT NULL,
+  sql              TEXT NOT NULL,
+  refresh_interval INT  NOT NULL DEFAULT 60,  -- seconds
+  next_run_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+
+jobs (
+  id           TEXT PRIMARY KEY,       -- "job_<uuid4_hex>"
+  tenant_id    TEXT REFERENCES tenants(id),
+  dashboard_id TEXT REFERENCES dashboards(id),
+  sql          TEXT NOT NULL,
+  status       TEXT CHECK (status IN ('pending','running','done','failed')),
+  claimed_by   TEXT REFERENCES agents(id),
+  claimed_at   TIMESTAMPTZ,
+  timeout_ms   INT  NOT NULL DEFAULT 30000,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+
+results (
+  dashboard_id  TEXT PRIMARY KEY REFERENCES dashboards(id),
+  tenant_id     TEXT REFERENCES tenants(id),
+  job_id        TEXT NOT NULL,         -- idempotency key
+  status        TEXT NOT NULL,         -- "success" | "error"
+  rows          JSONB,
+  row_count     INT,
+  execution_ms  INT,
+  truncated     BOOLEAN DEFAULT false,
+  error_code    TEXT,
+  error_message TEXT,
+  recorded_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+```
+
+Index on `jobs(tenant_id, status)` ensures the scheduler's pending-job query does not do a full table scan.
+
+---
+
+## Key Technical Decisions
+
+**Why long-polling instead of WebSockets or a message queue?**
+
+The requirement is that all traffic must be outbound from the data plane — no inbound firewall holes. Long-polling satisfies this with plain HTTPS. The agent makes a `GET` request and the server holds it open for up to 25 seconds waiting for a job. No persistent connection state, no broker to operate, no Kafka to manage. At this scale, HTTPS polling is the correct tool.
+
+**Why SHA-256 for token storage instead of bcrypt?**
+
+Agent tokens are generated with `secrets.token_hex(32)` — 256 bits of cryptographic randomness. There is no dictionary to attack. bcrypt's deliberate slowness (~150ms per hash) exists to resist brute-force on low-entropy secrets like passwords. Applying it to a 256-bit random token adds 150ms latency to every API request with zero security improvement. SHA-256 is correct here.
+
+**Why asyncpg instead of psycopg2?**
+
+FastAPI runs on asyncio. A synchronous database driver inside an `async def` route blocks the entire event loop during the query — the server becomes single-threaded under any database load. asyncpg is async-native, shares the event loop, and is approximately 3x faster than psycopg2 in benchmarks.
+
+**Why `FOR UPDATE SKIP LOCKED` in the job claim query?**
+
+This is the standard Postgres pattern for a job queue. When multiple agents for the same tenant race to claim a job, `SKIP LOCKED` causes each agent to skip rows that are already locked by another agent rather than waiting. No deadlocks. No application-level locking. No external queue infrastructure.
+
+**Why the stale-job reaper?**
+
+Without it, an agent crash mid-execution leaves the job permanently in `running` status. The scheduler reaper runs every 5 seconds and resets any job that has been in `running` for longer than 40 seconds back to `pending`. This gives the system automatic recovery from agent crashes with no manual intervention.
+
+---

@@ -1,85 +1,125 @@
-# Tinybrain — Data Plane / Control Plane Split
+# Tinybrain
 
-A working implementation of the Databrain data-plane + control-plane architecture.
+A working implementation of a data-plane / control-plane split architecture.
 
-## Architecture in One Paragraph
-
-`tinybrain-control` is a SaaS API (FastAPI + Postgres) that owns dashboard definitions, user/tenant state, job scheduling, and cached results. `tinybrain-agent` is a lightweight worker that runs inside the customer's network, polls the control plane for jobs, executes SQL against a local DuckDB (standing in for the customer's warehouse), and posts results back. The control plane **never opens a connection toward the agent** — all traffic is outbound from the data plane. Warehouse credentials never leave the customer's network.
-
-For the full design rationale, boundary table, protocol spec, and migration plan → **[DESIGN.md](./DESIGN.md)**
+The control plane is a SaaS API that owns dashboard definitions, tenant accounts, job scheduling, and cached results. The data plane is a lightweight agent that runs inside the customer's network, polls for jobs, executes SQL against a local database, and posts results back. The control plane never connects to the agent. Warehouse credentials never leave the customer's network.
 
 ---
 
-## Prerequisites
+## How it works
 
-| Tool | Version | Install |
-|---|---|---|
-| Docker Desktop | 4.x+ | https://www.docker.com/products/docker-desktop |
-| Docker Compose | v2 (bundled with Docker Desktop) | bundled |
-| Python 3 | 3.8+ (for demo.sh parsing) | https://www.python.org |
-| curl | any | pre-installed on Mac/Linux; Git Bash on Windows |
-| Git | any | https://git-scm.com |
+A user loads an embedded dashboard. The browser calls the control plane, which reads a pre-computed result from its database and returns it instantly. No warehouse query happens on the user-facing request path.
 
-> **Windows users:** Run `demo.sh` inside Git Bash or WSL2, not CMD or PowerShell.
+In the background, a scheduler creates jobs for each dashboard based on its refresh interval. The agent running in the customer's network picks up jobs by polling the control plane, runs the SQL locally against DuckDB, and posts the result back. The next time someone loads the dashboard, the fresh result is already there.
+
+Tenant isolation is enforced at the database level. Every job query has `WHERE tenant_id = agent's own tenant`. An agent from a different tenant gets a 204 response — the job simply does not exist from their perspective.
 
 ---
 
-## Run the Full Stack
+## Requirements
+
+You need these installed before running anything:
+
+- **Docker Desktop** — https://www.docker.com/products/docker-desktop  
+  After installing, open it and wait for the whale icon in the system tray to stop animating. Docker Desktop must be running before you use any docker commands.
+
+- **Git** — https://git-scm.com  
+  On Windows, install with Git Bash included.
+
+- **Python 3** — https://www.python.org  
+  Used by the demo script to parse JSON responses. Version 3.8 or higher.
+
+- **curl** — pre-installed on Mac and Linux. On Windows it comes with Git Bash.
+
+---
+
+## Getting started
+
+Clone the repository and move into the folder:
 
 ```bash
-# 1. Clone the repo
-git clone https://github.com/YOUR_USERNAME/tinybrain.git
+git clone https://github.com/Raghu-2005/tinybrain.git
 cd tinybrain
-
-# 2. One-command bring-up (builds images, starts Postgres + control + 2 agents)
-docker compose up -d --build
-
-# 3. Verify everything is healthy
-docker compose ps
-
-# 4. Check control plane logs
-docker compose logs -f control
 ```
 
-The control plane is available at **http://localhost:8000**  
-Swagger UI (auto-generated API docs): **http://localhost:8000/docs**
+Build and start the entire stack:
+
+```bash
+docker compose up -d --build
+```
+
+This starts four containers — Postgres, the control plane, and two agent containers representing two different tenants. The first run takes 3 to 5 minutes because Docker downloads base images and installs dependencies. Subsequent runs use cached layers and take about 10 seconds.
+
+Wait for everything to be ready:
+
+```bash
+docker compose ps
+```
+
+You should see all four containers running:
+
+```
+NAME                    STATUS
+tinybrain-postgres-1    healthy
+tinybrain-control-1     running
+tinybrain-agent-a-1     running
+tinybrain-agent-b-1     running
+```
+
+Confirm the API is live:
+
+```bash
+curl http://localhost:8000/health
+```
+
+Expected response:
+
+```json
+{"status": "ok", "service": "tinybrain-control"}
+```
 
 ---
 
-## Run the Demo Script
+## Running the demo
+
+The demo script runs the full end-to-end test. It creates two tenants, enrolls both agents, defines a dashboard for each tenant, waits for results to populate, reads the embedding endpoints, proves tenant isolation, and demonstrates token revocation.
 
 ```bash
-# Make executable (first time only)
 chmod +x demo.sh
-
-# Run the full end-to-end demo
 ./demo.sh
 ```
 
-The demo script:
-1. Creates two tenants (Acme Retail Corp + SaaS Metrics Inc)
-2. Enrolls both agents using one-time tokens
-3. Defines a dashboard on each tenant
-4. Waits for results to populate
-5. Queries both embedding endpoints and prints the result rows
-6. **Proves tenant isolation** — a different tenant's agent polls for jobs and gets 204 (job exists but is invisible)
-7. **Demonstrates revocation** — enrolls a fresh agent, confirms heartbeat works, revokes it, confirms subsequent heartbeat + poll return 401
+On Windows, run this in Git Bash, not PowerShell or CMD.
+
+The script takes about 60 seconds to complete. Every line should show a green checkmark. The final output should be:
+
+```
+PASSED: 14
+All checks passed.
+```
+
+The two most important checks to look for:
+
+```
+✓ PASS  ISOLATION CONFIRMED — Got 204: Tenant A job invisible to different tenant
+✓ PASS  POST-REVOKE heartbeat → 401 Unauthorized
+```
 
 ---
 
-## Manual curl Walkthrough
+## API endpoints
 
-If you want to exercise the API yourself:
+The control plane runs at `http://localhost:8000`. You can browse all endpoints at `http://localhost:8000/docs`.
 
+**Create a tenant:**
 ```bash
-# Create a tenant
 curl -X POST http://localhost:8000/v1/tenants \
   -H "Content-Type: application/json" \
   -d '{"name": "My Company"}'
+```
 
-# Response includes enrollment_token — pass it to the agent via env var
-
-# Create a dashboard
+**Create a dashboard:**
+```bash
 curl -X POST http://localhost:8000/v1/dashboards \
   -H "Content-Type: application/json" \
   -d '{
@@ -88,89 +128,66 @@ curl -X POST http://localhost:8000/v1/dashboards \
     "sql": "SELECT region, SUM(revenue) FROM sales GROUP BY region",
     "refresh_interval": 30
   }'
+```
 
-# Fetch the embedded result (after agent runs the job)
+**Read dashboard results (embedding endpoint):**
+```bash
 curl http://localhost:8000/v1/dashboards/dsh_.../data
+```
 
-# Revoke an agent
+**Revoke an agent:**
+```bash
 curl -X POST http://localhost:8000/v1/admin/agents/agt_.../revoke \
   -H "X-Admin-Key: dev-admin-key"
 ```
 
 ---
 
-## Project Structure
+## Project structure
 
 ```
 tinybrain/
-├── DESIGN.md                  # Section 1 — Architecture & design document
-├── README.md                  # This file
-├── docker-compose.yml         # Full stack orchestration
-├── demo.sh                    # End-to-end demo + isolation proof
-├── .env                       # Auto-generated by demo.sh (gitignored)
+├── DESIGN.md                    Architecture design document (Section 1)
+├── README.md                    This file
+├── docker-compose.yml           Stack orchestration
+├── demo.sh                      End-to-end demo and test script
 │
-├── control/                   # tinybrain-control (SaaS control plane)
+├── control/                     Control plane (SaaS API)
 │   ├── Dockerfile
 │   ├── requirements.txt
-│   ├── main.py                # FastAPI app + lifespan (startup/shutdown)
-│   ├── db.py                  # asyncpg pool + schema creation
-│   ├── auth.py                # Token generation + SHA-256 hashing
-│   ├── scheduler.py           # Background job enqueuer + stale-job reaper
-│   ├── models.py              # Pydantic request/response models
+│   ├── main.py                  FastAPI entry point and startup
+│   ├── db.py                    Postgres connection pool and schema
+│   ├── auth.py                  Token generation and SHA-256 hashing
+│   ├── scheduler.py             Background job enqueuer and stale-job reaper
+│   ├── models.py                Pydantic request and response models
 │   └── routes/
-│       ├── tenants.py         # POST /v1/tenants
-│       ├── dashboards.py      # POST /v1/dashboards, GET /v1/dashboards/:id/data
-│       └── agent.py           # Enroll, heartbeat, job poll, result, revoke
+│       ├── tenants.py           POST /v1/tenants
+│       ├── dashboards.py        POST /v1/dashboards, GET /v1/dashboards/:id/data
+│       └── agent.py             Enroll, heartbeat, job poll, result, revoke
 │
-└── agent/                     # tinybrain-agent (customer-hosted data plane)
+└── agent/                       Data plane (customer-hosted worker)
     ├── Dockerfile
     ├── requirements.txt
-    ├── agent.py               # Main worker: enroll → heartbeat → poll → execute → post
-    └── seed.py                # Seeds DuckDB with synthetic warehouse data per tenant
+    ├── agent.py                 Main worker loop
+    └── seed.py                  Seeds DuckDB with synthetic warehouse data
 ```
 
 ---
 
-## Key Design Decisions
+## Stopping the stack
 
-**Why long-polling instead of WebSockets or a message queue?**  
-The brief requires all traffic outbound from the data plane with no inbound firewall holes. Long-polling satisfies this with simple HTTPS — the agent initiates a GET, the server holds it open up to 25 seconds, and returns a job or 204. No persistent connection state, no broker to operate.
+Stop all containers but keep the database data:
 
-**Why SHA-256 for token storage instead of bcrypt?**  
-Agent tokens are 256-bit random values (32 bytes from `secrets.token_hex`). There is no dictionary to attack, so bcrypt's deliberate slowness adds latency (~150ms per request) with zero security benefit. SHA-256 is fast and sufficient. Passwords — which have low entropy — need bcrypt; random tokens do not.
-
-**Why `FOR UPDATE SKIP LOCKED` in the job query?**  
-Postgres's `SKIP LOCKED` is the standard pattern for a job queue. It lets multiple agents (if a tenant ever runs more than one) race to claim jobs without deadlocks. Any agent that would have to wait for a lock simply skips that row and checks the next — no blocking, no retries at the application layer.
-
-**Why asyncpg over psycopg2?**  
-FastAPI is fully async. A synchronous DB driver inside an async route blocks the entire event loop during the query — effectively making the server single-threaded. asyncpg is async-native and approximately 3x faster than psycopg2 in benchmarks.
-
----
-
-## Failure Mode: Agent Token Revocation
-
-Demonstrated in `demo.sh` Step 8.
-
-When an agent is compromised or decommissioned, an admin calls:
-```
-POST /v1/admin/agents/:id/revoke
-X-Admin-Key: dev-admin-key
+```bash
+docker compose down
 ```
 
-The control plane sets `revoked_at` on the agent record. All subsequent requests (heartbeat, job poll) from that agent return **401 Unauthorized**. The agent process detects 401 and calls `os._exit(1)` — it does not retry, which would just spam a known-bad token.
+Stop everything and delete all data for a clean reset:
 
-The stale-job reaper in the scheduler automatically resets any job that was `running` when the agent was killed — it becomes `pending` again and is picked up by any healthy agent for that tenant.
+```bash
+docker compose down -v
+```
+
+After a full reset, run `docker compose up -d --build` followed by `./demo.sh` to start fresh.
 
 ---
-
-## With Another Full Day
-
-The four things I'd prioritise, in order:
-
-1. **Proper migrations with Alembic** — the current `CREATE TABLE IF NOT EXISTS` approach works for a demo but doesn't handle schema changes on a live database. Alembic with versioned migration files is the production answer.
-
-2. **Per-tenant job queue visibility endpoint** — operators need to see pending/running/failed jobs per tenant without SSHing into Postgres. A `GET /v1/tenants/:id/jobs` endpoint with status filtering would make this operable.
-
-3. **Result pagination on the embedding endpoint** — large result sets (thousands of rows) should be paginated rather than returned as a single JSON blob, even with the 1MB truncation guard.
-
-4. **Structured JSON logging + correlation IDs** — every request should carry a `request_id` that flows through control plane logs and gets included in the job payload so agent logs can be correlated with control plane logs. Currently logs are human-readable but not machine-parseable.

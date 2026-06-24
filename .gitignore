@@ -1,0 +1,41 @@
+# Environment files — contain enrollment tokens, never commit these
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+
+# DuckDB data files — local warehouse data, not part of the codebase
+*.db
+*.duckdb
+
+# Docker volumes (if accidentally created locally)
+postgres_data/
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+.env
+*.db

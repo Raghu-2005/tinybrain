@@ -1,0 +1,82 @@
+networks:
+  tinybrain:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  agent_a_data:
+  agent_b_data:
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER:     tinybrain
+      POSTGRES_PASSWORD: tinybrain
+      POSTGRES_DB:       tinybrain
+    command: >
+      postgres
+      -c shared_buffers=64MB
+      -c work_mem=4MB
+      -c max_connections=20
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - tinybrain
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tinybrain"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    restart: unless-stopped
+
+  control:
+    build:
+      context:    ./control
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL:  postgresql://tinybrain:tinybrain@postgres:5432/tinybrain
+      ADMIN_API_KEY: dev-admin-key
+    ports:
+      - "8000:8000"
+    networks:
+      - tinybrain
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  agent-a:
+    build:
+      context:    ./agent
+      dockerfile: Dockerfile
+    environment:
+      CONTROL_PLANE_URL:  http://control:8000
+      ENROLLMENT_TOKEN:   "${AGENT_A_TOKEN}"
+      TENANT_ID:          "${TENANT_A_ID}"
+      TENANT_SEED:        "A"
+      DB_PATH:            /data/warehouse.db
+      HEARTBEAT_INTERVAL: "30"
+    volumes:
+      - agent_a_data:/data
+    networks:
+      - tinybrain
+    restart: unless-stopped
+
+  agent-b:
+    build:
+      context:    ./agent
+      dockerfile: Dockerfile
+    environment:
+      CONTROL_PLANE_URL:  http://control:8000
+      ENROLLMENT_TOKEN:   "${AGENT_B_TOKEN}"
+      TENANT_ID:          "${TENANT_B_ID}"
+      TENANT_SEED:        "B"
+      DB_PATH:            /data/warehouse.db
+      HEARTBEAT_INTERVAL: "30"
+    volumes:
+      - agent_b_data:/data
+    networks:
+      - tinybrain
+    restart: unless-stopped

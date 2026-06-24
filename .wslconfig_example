@@ -1,0 +1,16 @@
+# ─────────────────────────────────────────────────────────────────
+# FOR WINDOWS USERS WITH 4GB RAM ONLY
+#
+# If Docker is using too much memory on Windows, do this:
+#
+# 1. Open Notepad as Administrator
+# 2. Save this content to:  C:\Users\YourName\.wslconfig
+#    (replace YourName with your Windows username)
+# 3. Restart Docker Desktop
+#
+# This caps WSL2 (which Docker uses) to 1.5GB RAM.
+# ─────────────────────────────────────────────────────────────────
+[wsl2]
+memory=1536MB
+processors=2
+swap=512MB
